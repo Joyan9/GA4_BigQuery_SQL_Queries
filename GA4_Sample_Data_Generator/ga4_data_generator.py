@@ -9,11 +9,12 @@ Anomalies injected:
   B. Cross-domain tracking failure (payment gateway referral)
   C. Missing session_start events (bad GTM deploy window)
   D. Missing attribution → (not set) (CMP/consent blocking)
+  E. Session timeout (no session_start event)
 
 Outputs:
-  ga4_events.jsonl       — BQ-ready NDJSON, one event per line
-  ga4_schema.json        — BigQuery JSON schema for bq load
-  anomaly_manifest.csv   — Anomaly registry with date ranges and descriptions
+  events_YYYYMMDD.jsonl       — NDJSON, one event per line, one file per day
+  ga4_schema.json             — BigQuery JSON schema for bq load
+  anomaly_manifest.csv        — Anomaly registry with date ranges and descriptions
 """
 
 import json
@@ -82,6 +83,25 @@ ANOMALY_D_AFFECTED_RATIO   = 0.25   # 25% of sessions lose attribution
 ANOMALY_E_AFFECTED_RATIO = 0.06  # 6% of sessions in window
 
 OUTPUT_DIR = "./outputs"
+
+# =============================================================================
+# Experiment config
+# =============================================================================
+# Single experiment: Black Friday 2025
+EXPERIMENTS = {
+    "BF2025": {
+        "tool_id": "EXP",
+        "experience_id": "BF2025",
+        "n_variants": 2,
+        "start": datetime(2025, 11, 1),
+        "end": datetime(2025, 11, 28),
+        "pages": ["/products/"],  # prefix match for PDPs
+        "sample_rate": 1.0,        # apply to all eligible users
+    }
+}
+
+# Runtime experiment impression counters: {exp_key: {date_str: {variant_string: count}}}
+EXPERIMENT_STATS = {}
 
 # =============================================================================
 # REFERENCE DATA
@@ -295,6 +315,25 @@ def make_user_property(key, string_value=None, int_value=None, set_timestamp_mic
     if set_timestamp_micros:
         value["set_timestamp_micros"] = set_timestamp_micros
     return {"key": key, "value": value}
+
+
+# =============================================================================
+# Experiment helpers
+# =============================================================================
+def assign_variant_for_user(user_pseudo_id, experience_id, n_variants):
+    """Deterministically assign a variant index (0..n_variants-1) per user + experience."""
+    h = hashlib.md5((user_pseudo_id + experience_id).encode()).hexdigest()
+    return int(h[:8], 16) % n_variants
+
+
+def generate_exp_variant_string(tool_id, experience_id, variant_index):
+    """Return exp_variant_string in format XXX-YYYYYYYYY-ZZZZZZZZ.
+
+    We format the variant id as two-digit zero-padded number (01,02,...).
+    """
+    variant_id = str(variant_index + 1).zfill(2)
+    return f"{tool_id}-{experience_id}-{variant_id}"
+
 
 
 # =============================================================================
@@ -520,6 +559,19 @@ def make_view_item_event(user, session_id, session_number, event_dt,
     return ev
 
 
+def make_experience_impression_event(user, session_id, session_number, event_dt,
+                                     page_path, page_referrer, traffic_src, device, geo,
+                                     prev_ts, exp_variant_string,
+                                     batch_event_index=0, batch_page_id=1):
+    ev = base_event(user, session_id, session_number, "experience_impression",
+                    event_dt, page_path, page_referrer, traffic_src, device, geo,
+                    prev_timestamp=prev_ts,
+                    batch_event_index=batch_event_index,
+                    batch_page_id=batch_page_id)
+    add_event_param(ev, "exp_variant_string", string_value=exp_variant_string)
+    return ev
+
+
 def make_add_to_cart_event(user, session_id, session_number, event_dt,
                             page_path, page_referrer, traffic_src, device, geo,
                             prev_ts, product, quantity=1):
@@ -630,6 +682,7 @@ def make_purchase_event(user, session_id, session_number, event_dt,
 def generate_session(user, date, anomalies_active):
     """Generate all events for a single session."""
     events = []
+    global EXPERIMENT_STATS
     session_id     = generate_session_id()
     user["session_count"] += 1
     session_number = user["session_count"]
@@ -730,6 +783,39 @@ def generate_session(user, date, anomalies_active):
         pii_referrer = None
 
     events.append(pv)
+    # ── Experiment: emit experience_impression on PDP entrance when applicable
+    try:
+        for exp_key, exp in EXPERIMENTS.items():
+            # sample rate
+            if random.random() > exp.get("sample_rate", 1.0):
+                continue
+            # check date window
+            if not in_window(date, exp["start"], exp["end"]):
+                continue
+            # page prefix match (apply on entrance PDPs)
+            if page_path and any(page_path.startswith(p) for p in exp.get("pages", [])):
+                variant_index = assign_variant_for_user(user["user_pseudo_id"], exp["experience_id"], exp["n_variants"])
+                exp_variant_string = generate_exp_variant_string(exp["tool_id"], exp["experience_id"], variant_index)
+                # schedule impression shortly after the page_view timestamp
+                imp_dt = current_dt + timedelta(milliseconds=50)
+                imp = make_experience_impression_event(user, session_id, session_number, imp_dt,
+                                                      page_path, page_ref, traffic_src, device, geo,
+                                                      prev_ts, exp_variant_string,
+                                                      batch_event_index=0, batch_page_id=1)
+                events.append(imp)
+                # advance prev_ts/current_dt so subsequent events are ordered
+                prev_ts = to_micros(imp_dt)
+                current_dt = imp_dt + timedelta(seconds=random.randint(1, 3))
+
+                # record in EXPERIMENT_STATS
+                date_key = date.strftime("%Y%m%d")
+                EXPERIMENT_STATS.setdefault(exp_key, {})
+                EXPERIMENT_STATS[exp_key].setdefault(date_key, {})
+                EXPERIMENT_STATS[exp_key][date_key].setdefault(exp_variant_string, 0)
+                EXPERIMENT_STATS[exp_key][date_key][exp_variant_string] += 1
+    except Exception:
+        # defensive: experiments must not break generation
+        pass
     prev_ts = to_micros(current_dt)
     current_dt += timedelta(seconds=random.randint(5, 30))
 
@@ -757,6 +843,30 @@ def generate_session(user, date, anomalies_active):
                                     prev_ts=prev_ts, is_entrance=False,
                                     batch_event_index=i+1, batch_page_id=batch_page_id)
         events.append(pv2)
+        # ── Experiment: emit experience_impression on PDP page views as well
+        try:
+            for exp_key, exp in EXPERIMENTS.items():
+                if random.random() > exp.get("sample_rate", 1.0):
+                    continue
+                if not in_window(date, exp["start"], exp["end"]):
+                    continue
+                if next_path and any(next_path.startswith(p) for p in exp.get("pages", [])):
+                    variant_index = assign_variant_for_user(user["user_pseudo_id"], exp["experience_id"], exp["n_variants"])
+                    exp_variant_string = generate_exp_variant_string(exp["tool_id"], exp["experience_id"], variant_index)
+                    imp_dt = current_dt + timedelta(milliseconds=50)
+                    imp = make_experience_impression_event(user, session_id, session_number, imp_dt,
+                                                          next_path, referrer, traffic_src, device, geo,
+                                                          prev_ts, exp_variant_string,
+                                                          batch_event_index=i+1, batch_page_id=batch_page_id)
+                    events.append(imp)
+                    # record in EXPERIMENT_STATS
+                    date_key = date.strftime("%Y%m%d")
+                    EXPERIMENT_STATS.setdefault(exp_key, {})
+                    EXPERIMENT_STATS[exp_key].setdefault(date_key, {})
+                    EXPERIMENT_STATS[exp_key][date_key].setdefault(exp_variant_string, 0)
+                    EXPERIMENT_STATS[exp_key][date_key][exp_variant_string] += 1
+        except Exception:
+            pass
         prev_ts = to_micros(current_dt)
         current_dt += timedelta(seconds=random.randint(10, 90))
         batch_page_id += 1
@@ -819,6 +929,10 @@ def generate_all_events():
         "D": {"count": 0, "sessions": 0},
         "E": {"count": 0, "sessions": 0},
     }
+
+    # initialize experiment stats counters
+    global EXPERIMENT_STATS
+    EXPERIMENT_STATS = {k: {} for k in EXPERIMENTS.keys()}
 
     current_date = START_DATE
     total_days   = (END_DATE - START_DATE).days + 1
@@ -1049,12 +1163,24 @@ def build_bq_schema():
 def write_outputs(events, anomaly_stats):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ── ga4_events.jsonl ──────────────────────────────────────────────────────
-    jsonl_path = f"{OUTPUT_DIR}/ga4_events.jsonl"
-    print(f"\nWriting {len(events):,} events to {jsonl_path} ...")
-    with open(jsonl_path, "w", encoding="utf-8") as f:
-        for ev in events:
-            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    # ── Group events by date and write daily JSONL files ─────────────────────
+    events_by_date = {}
+    for ev in events:
+        date_key = ev["event_date"]  # Format: "YYYYMMDD"
+        if date_key not in events_by_date:
+            events_by_date[date_key] = []
+        events_by_date[date_key].append(ev)
+
+    print(f"\nWriting {len(events):,} events across {len(events_by_date)} days...")
+    jsonl_paths = []
+    for date_key in sorted(events_by_date.keys()):
+        daily_events = events_by_date[date_key]
+        jsonl_path = f"{OUTPUT_DIR}/events_{date_key}.jsonl"
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for ev in daily_events:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        jsonl_paths.append(jsonl_path)
+        print(f"  {date_key}: {len(daily_events):,} events → events_{date_key}.jsonl")
     print("  Done.")
 
     # ── ga4_schema.json ───────────────────────────────────────────────────────
@@ -1151,7 +1277,21 @@ def write_outputs(events, anomaly_stats):
         print(f"    [{k}] {labels[k]:<25} {v['sessions']:>6,} sessions  |  {v['count']:>7,} events")
     print("="*65)
 
-    return jsonl_path
+    # ── Experiment impressions summary
+    if EXPERIMENT_STATS:
+        print("\nExperiment impressions:")
+        for exp_key, dates in EXPERIMENT_STATS.items():
+            print(f"  {exp_key}:")
+            total_exp = 0
+            for date_key in sorted(dates.keys()):
+                parts = []
+                for variant, cnt in sorted(dates[date_key].items()):
+                    parts.append(f"{variant}={cnt}")
+                    total_exp += cnt
+                print(f"    {date_key}: {' '.join(parts)}")
+            print(f"    Total impressions: {total_exp}")
+
+    return jsonl_paths
 
 
 # =============================================================================
@@ -1166,5 +1306,5 @@ if __name__ == "__main__":
     print("Generating events...")
     events, anomaly_stats = generate_all_events()
 
-    jsonl_path = write_outputs(events, anomaly_stats)
-    print(f"\nGenerated JSONL file: {jsonl_path}")
+    jsonl_paths = write_outputs(events, anomaly_stats)
+    print(f"\nGenerated {len(jsonl_paths)} daily JSONL files in {OUTPUT_DIR}/")

@@ -6,7 +6,7 @@ This project has been separated into two independent scripts:
 Generates 90 days of realistic GA4 e-commerce event data with injected anomalies.
 
 **Outputs:**
-- `outputs/ga4_events.jsonl` — BigQuery-ready NDJSON (one event per line)
+- `outputs/events_YYYYMMDD.jsonl` — Daily event files in BigQuery-ready NDJSON format (one file per day)
 - `outputs/ga4_schema.json` — BigQuery JSON schema
 - `outputs/anomaly_manifest.csv` — Anomaly registry with metadata
 
@@ -20,15 +20,16 @@ Uses the [dlt (Data Load Tool)](https://dlthub.com) library to load events into 
 
 **Key Features:**
 - ✅ **NO UNNESTING** — Nested structures (`event_params`, `items`, etc.) preserved as-is
+- Processes all daily event files from the outputs directory
 - Configurable via `.env` file
 - Progress logging and error handling
 - Supports `WRITE_TRUNCATE`, `WRITE_APPEND`, `WRITE_EMPTY` dispositions
 
 **Run:**
 ```bash
-python ga4_uploader_dlt.py [path_to_jsonl]
+python ga4_uploader_dlt.py [path_to_jsonl_or_directory]
 
-# Default (uses ./outputs/ga4_events.jsonl):
+# Default (uses ./outputs/ directory with all events_*.jsonl files):
 python ga4_uploader_dlt.py
 ```
 
@@ -104,7 +105,11 @@ Generating events...
   ...
   Processing day 91/2024-12-30
 
-Writing 412,857 events to ./outputs/ga4_events.jsonl ...
+Writing 412,857 events across 91 days...
+  20241001: 4,520 events → events_20241001.jsonl
+  20241002: 5,180 events → events_20241002.jsonl
+  ...
+  20241230: 4,890 events → events_20241230.jsonl
   Done.
 Writing schema to ./outputs/ga4_schema.json ...
   Done.
@@ -126,8 +131,8 @@ Configuration:
   Table ID:   ga4_events
   Project ID: your-gcp-project-id
 
-Loading events from ./outputs/ga4_events.jsonl ...
-  Loaded 412,857 events
+Loading events from ./outputs/...
+  Found 91 daily event files
 
 Setting up dlt pipeline...
   Destination: BigQuery
@@ -176,12 +181,15 @@ If you **want unnesting**, modify `ga4_uploader_dlt.py`:
 
 ```
 .
-├── ga4_generator.py              # Data generation script
+├── ga4_data_generator.py         # Data generation script
 ├── ga4_uploader_dlt.py           # dlt-based uploader
 ├── requirements.txt              # Python dependencies
 ├── .env                          # Configuration (create this)
 ├── outputs/
-│   ├── ga4_events.jsonl          # Generated events (NDJSON)
+│   ├── events_20251001.jsonl     # Daily event files (NDJSON)
+│   ├── events_20251002.jsonl
+│   ├── ...
+│   ├── events_20251231.jsonl
 │   ├── ga4_schema.json           # BigQuery schema
 │   └── anomaly_manifest.csv      # Anomaly metadata
 └── README.md                     # This file
@@ -238,6 +246,37 @@ In `.env`:
 BQ_WRITE_DISPOSITION=WRITE_APPEND    # Add to existing data
 BQ_WRITE_DISPOSITION=WRITE_EMPTY     # Only write if table is empty
 ```
+
+
+## Experiments
+
+This generator can emit `experience_impression` events for experiments (A/B or multi-variant). Key points:
+
+- **Event name:** `experience_impression`
+- **Important event_param:** `exp_variant_string` — format: `<tool_id>-<experience_id>-<variant>` (example: `EXP-BF2025-01`).
+- **When it fires:** On product detail page loads (PDPs). The generator emits impressions both for entrance page_views and subsequent product page_views.
+- **Deterministic assignment:** Variants are assigned deterministically by hashing `user_pseudo_id + experience_id` and taking modulo `n_variants`, ensuring stable assignment across sessions.
+
+Configuration lives in `ga4_data_generator.py` as the `EXPERIMENTS` mapping. Example:
+
+```python
+EXPERIMENTS = {
+  "BF2025": {
+    "tool_id": "EXP",
+    "experience_id": "BF2025",
+    "n_variants": 2,
+    "start": datetime(2025, 11, 1),
+    "end": datetime(2025, 11, 28),
+    "pages": ["/products/"],  # prefix match for PDPs
+    "sample_rate": 1.0,        # apply to all eligible users
+  }
+}
+```
+
+- **`pages`** accepts path prefixes — any page path that starts with a configured prefix is eligible.
+- **`sample_rate`** (0.0–1.0) throttles how many eligible users receive the experiment.
+
+The generator prints an impressions summary after running (`Experiment impressions:`) and includes per-date, per-variant counts. Use the `exp_variant_string` field to build audiences, segments, or to filter impressions in BigQuery.
 
 ---
 
