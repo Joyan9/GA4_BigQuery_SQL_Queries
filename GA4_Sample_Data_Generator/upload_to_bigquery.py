@@ -8,10 +8,15 @@ from google.oauth2 import service_account
 load_dotenv()
 
 # --- CONFIGURATION ---
-PROJECT_ID = 'upheld-setting-420306'
-DATASET_ID = 'ga4_dataset'
 DIRECTORY_PATH = './outputs'
 SCHEMA_PATH = './outputs/ga4_schema.json'
+
+def get_required_env(name):
+    """Return required environment variable value or raise a clear error."""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value.strip()
 
 def load_schema(schema_path):
     """Loads a standard BigQuery JSON schema file."""
@@ -22,12 +27,15 @@ def load_schema(schema_path):
     return [bigquery.SchemaField.from_api_repr(field) for field in schema_data]
 
 def upload_jsonl_to_bigquery():
+    project_id = get_required_env("GOOGLE_CLOUD_PROJECT")
+    dataset_id = get_required_env("BIGQUERY_DATASET_ID")
+
     # 1. Authenticate using the inline JSON from .env
-    service_account_info = json.loads(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+    service_account_info = json.loads(get_required_env("GOOGLE_SERVICE_ACCOUNT_JSON"))
     credentials = service_account.Credentials.from_service_account_info(service_account_info)
     
-    client = bigquery.Client(project=PROJECT_ID, credentials=credentials)
-    dataset_ref = client.dataset(DATASET_ID)
+    client = bigquery.Client(project=project_id, credentials=credentials)
+    dataset_ref = client.dataset(dataset_id)
 
     # 2. Load your custom schema
     table_schema = load_schema(SCHEMA_PATH)
