@@ -40,11 +40,11 @@ START_DATE = datetime(2025, 10, 1)
 END_DATE   = datetime(2025, 12, 31)
 
 # Baseline traffic
-MIN_SESSIONS_PER_DAY = 600
-MAX_SESSIONS_PER_DAY = 1400
+MIN_SESSIONS_PER_DAY = 1800
+MAX_SESSIONS_PER_DAY = 4200
 
 # User pool — realistic returning user ratio (~30%)
-USER_POOL_SIZE = 8000
+USER_POOL_SIZE = 12000
 RETURNING_USER_RATIO = 0.30
 
 # Site config
@@ -333,6 +333,19 @@ def generate_exp_variant_string(tool_id, experience_id, variant_index):
     """
     variant_id = str(variant_index + 1).zfill(2)
     return f"{tool_id}-{experience_id}-{variant_id}"
+
+
+def get_bf2025_funnel_multipliers(variant_index):
+    """Return funnel rate multipliers for the BF2025 experiment.
+
+    Variant 01 acts as control and remains slightly below baseline, while
+    variant 02 gets a clear conversion lift so the winner is obvious in BI.
+    """
+    if variant_index == 0:
+        return 0.90, 0.88, 0.82
+    if variant_index == 1:
+        return 1.10, 1.22, 1.75
+    return 1.0, 1.0, 1.0
 
 
 
@@ -686,6 +699,7 @@ def generate_session(user, date, anomalies_active):
     session_id     = generate_session_id()
     user["session_count"] += 1
     session_number = user["session_count"]
+    session_experiment_variants = {}
 
     traffic_src = pick_traffic_source()
     device      = user["preferred_device"]
@@ -796,6 +810,7 @@ def generate_session(user, date, anomalies_active):
             if page_path and any(page_path.startswith(p) for p in exp.get("pages", [])):
                 variant_index = assign_variant_for_user(user["user_pseudo_id"], exp["experience_id"], exp["n_variants"])
                 exp_variant_string = generate_exp_variant_string(exp["tool_id"], exp["experience_id"], variant_index)
+                session_experiment_variants[exp_key] = variant_index
                 # schedule impression shortly after the page_view timestamp
                 imp_dt = current_dt + timedelta(milliseconds=50)
                 imp = make_experience_impression_event(user, session_id, session_number, imp_dt,
@@ -853,6 +868,7 @@ def generate_session(user, date, anomalies_active):
                 if next_path and any(next_path.startswith(p) for p in exp.get("pages", [])):
                     variant_index = assign_variant_for_user(user["user_pseudo_id"], exp["experience_id"], exp["n_variants"])
                     exp_variant_string = generate_exp_variant_string(exp["tool_id"], exp["experience_id"], variant_index)
+                    session_experiment_variants[exp_key] = variant_index
                     imp_dt = current_dt + timedelta(milliseconds=50)
                     imp = make_experience_impression_event(user, session_id, session_number, imp_dt,
                                                           next_path, referrer, traffic_src, device, geo,
@@ -885,7 +901,14 @@ def generate_session(user, date, anomalies_active):
         page_path = next_path
 
     # ── Add to cart ──────────────────────────────────────────────────────────
-    if selected_product and random.random() < ADD_TO_CART_RATE:
+    add_to_cart_multiplier = 1.0
+    begin_checkout_multiplier = 1.0
+    purchase_multiplier = 1.0
+    for exp_key, variant_index in session_experiment_variants.items():
+        if exp_key == "BF2025":
+            add_to_cart_multiplier, begin_checkout_multiplier, purchase_multiplier = get_bf2025_funnel_multipliers(variant_index)
+
+    if selected_product and random.random() < min(1.0, ADD_TO_CART_RATE * add_to_cart_multiplier):
         quantity = random.choices([1, 2], weights=[0.85, 0.15])[0]
         cart_items = [(selected_product, quantity)]
         atc = make_add_to_cart_event(user, session_id, session_number, current_dt,
@@ -897,7 +920,7 @@ def generate_session(user, date, anomalies_active):
         current_dt += timedelta(seconds=random.randint(10, 60))
 
         # ── Begin checkout ───────────────────────────────────────────────────
-        if cart_items and random.random() < (BEGIN_CHECKOUT_RATE / ADD_TO_CART_RATE):
+        if cart_items and random.random() < min(1.0, (BEGIN_CHECKOUT_RATE / ADD_TO_CART_RATE) * begin_checkout_multiplier):
             bc = make_begin_checkout_event(user, session_id, session_number, current_dt,
                                             "/checkout", build_page_url("/cart"),
                                             traffic_src, device, geo, prev_ts, cart_items)
@@ -906,7 +929,7 @@ def generate_session(user, date, anomalies_active):
             current_dt += timedelta(seconds=random.randint(30, 180))
 
             # ── Purchase ─────────────────────────────────────────────────────
-            if random.random() < (PURCHASE_RATE / BEGIN_CHECKOUT_RATE):
+            if random.random() < min(1.0, (PURCHASE_RATE / BEGIN_CHECKOUT_RATE) * purchase_multiplier):
                 purch, txn_id = make_purchase_event(
                     user, session_id, session_number, current_dt,
                     "/order-confirmation", build_page_url("/checkout/payment"),
