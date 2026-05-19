@@ -4,3 +4,5 @@ __pycache__/
 
 # ignore ga4_events file as it is quite large
 */outputs/events_*.jsonl
+
+/client_json_secret.json
